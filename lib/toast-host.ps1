@@ -1,6 +1,6 @@
 <#
-  dsh-notify 常驻浮窗宿主(Windows PowerShell + WPF)。
-  由 dsh-notify 宿主插件在加载时 spawn 一次并常驻:所有桌面浮窗都在本进程内创建,
+  dsh-notify-yimit 常驻浮窗宿主(Windows PowerShell + WPF)。
+  由 dsh-notify-yimit 宿主插件在加载时 spawn 一次并常驻:所有桌面浮窗都在本进程内创建,
   WPF 程序集只加载一次,通知创建延迟从 ~1s 冷启动降到 ~10ms(根治"总感觉慢")。
 
   协议(UTF-8,一行一个 JSON):
@@ -8,7 +8,7 @@
       {"cmd":"show","key":"running:s1","instance":1,"title":"...","text":"...",
        "bg":"#286ebd","fg":"#e6edf3","durationSec":8,"sticky":true,"offsetY":0,
        "sessionId":"s1","baseUrl":"http://127.0.0.1:3080",
-       "browserPath":"","winTitle":"dsh-notify-running:s1"}
+       "browserPath":"","winTitle":"dsh-notify-yimit-running:s1"}
       {"cmd":"text","key":...,"text":"..."}      # 原地更新内容(不重弹、零延迟)
       {"cmd":"move","key":...,"top":588}          # 平滑移动(220ms QuadraticEase)
       {"cmd":"close","key":...}                   # 160ms 淡出 + 20px 下坠后关闭
@@ -27,7 +27,7 @@ Add-Type -AssemblyName WindowsBase
 
 # WPF 必须运行在 STA 主线程(Windows PowerShell 5.1 控制台主线程为 STA)。
 if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne [System.Threading.ApartmentState]::STA) {
-  [Console]::Error.WriteLine("dsh-notify: 宿主需要 STA 主线程(当前 $([System.Threading.Thread]::CurrentThread.ApartmentState))")
+  [Console]::Error.WriteLine("dsh-notify-yimit: 宿主需要 STA 主线程(当前 $([System.Threading.Thread]::CurrentThread.ApartmentState))")
   exit 1
 }
 
@@ -211,7 +211,7 @@ function New-ToastWindow($cmd) {
   if (-not [string]::IsNullOrEmpty([string]$cmd.sessionId)) {
     # 跳转会始终打开浏览器(功能恒开启):用指定浏览器(空 = 系统默认)打开 DSH 并定位会话。
     $jumpBtn = New-ToastButton "跳转会话" ({
-      $url = "$($cmd.baseUrl)/#dsh-notify/session=$($cmd.sessionId)"
+      $url = "$($cmd.baseUrl)/#dsh-notify-yimit/session=$($cmd.sessionId)"
       try {
         if (-not [string]::IsNullOrEmpty([string]$cmd.browserPath)) {
           Start-Process -FilePath ([string]$cmd.browserPath) -ArgumentList $url

@@ -80,7 +80,7 @@ host: session/event(turn/start|assistant/chunk|tool/call|turn/end|session/title)
 client: 设置页「通知」配置 → 分发:
   - system → Web Notification(tag 按 会话:类型 替换,onclick 跳转会话)
   - custom → 只消费回执(不渲染页面内浮层;桌面浮窗由 host 负责)
-  - 会话深链接:监听 #dsh-notify/session=<id>(桌面浮窗"跳转会话"通道)→ ctx.sessions.open
+  - 会话深链接:监听 #dsh-notify-yimit/session=<id>(桌面浮窗"跳转会话"通道)→ ctx.sessions.open
 ```
 
 ## 配置存储

@@ -1,6 +1,6 @@
 {
   "name": "dsh-notify-yimit",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "DeepSeek Harness 通知插件:任务完成 / 任务出错 / 运行中(实时活动)/ 等待审批 / 等待回答 时,通过 Windows 系统通知或插件自定义样式通知提醒用户,支持点击跳转到对应会话;设置页集成在 DSH 设置界面。",
   "type": "module",
   "main": "lib/index.js",

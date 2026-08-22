@@ -1,6 +1,6 @@
-# dsh-notify bundle patch: one host row over the web profile.
+# dsh-notify-yimit bundle patch: one host row over the web profile.
 # The row name resolves from the profile's own node_modules where
 # `dsh plugin --profile web add <path>` installed this package.
 - insert:
-    - id: dsh-notify
-      name: dsh-notify
+    - id: dsh-notify-yimit
+      name: dsh-notify-yimit

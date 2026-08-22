@@ -48,8 +48,8 @@ Then **restart dsh web** (host-side plugins need a restart) and enable it in Set
 ```sh
 dsh plugin --profile web add dsh-notify-yimit
 # or manually:
-#   ~/.dsh/profiles/web/package.json → dependencies: "dsh-notify": "^0.1.0"
-#   ~/.dsh/profiles/web/package.json → dsh.profile.bundles: add "dsh-notify"
+#   ~/.dsh/profiles/web/package.json → dependencies: "dsh-notify-yimit": "^0.1.0"
+#   ~/.dsh/profiles/web/package.json → dsh.profile.bundles: add "dsh-notify-yimit"
 pnpm install   # inside the profile
 ```
 
@@ -83,7 +83,7 @@ host: session/event(turn/start|assistant/chunk|tool/call|turn/end|session/title)
 client: settings config → dispatch:
   - system → Web Notification (tag replaced per session:type, onclick jumps to session)
   - custom → only acknowledges events (no in-page overlay; desktop toasts are handled by the host)
-  - session deep link: listens to #dsh-notify/session=<id> (the toast "Jump to session" channel) → ctx.sessions.open
+  - session deep link: listens to #dsh-notify-yimit/session=<id> (the toast "Jump to session" channel) → ctx.sessions.open
 ```
 
 ## Config storage

@@ -35,7 +35,7 @@ The notification title is the conversation title; both system and custom notific
 ## Installation
 
 ```sh
-dsh plugin --profile web add <path-to-this-directory>
+dsh plugin --profile web add dsh-notify-yimit
 ```
 
 Then **restart dsh web** (host-side plugins need a restart) and enable it in Settings → Notifications.

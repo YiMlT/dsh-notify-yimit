@@ -5,7 +5,6 @@
     /
   <a href="./README.en.md">English</a>
 </p>
-
 DeepSeek Harness 通知插件:在 **任务完成 / 任务出错 / 运行中 / 等待审批 / 等待回答** 时提醒用户。
 通知标题为对话标题;系统通知与自定义通知均支持**点击跳转到对应会话**。
 
@@ -47,7 +46,7 @@ DeepSeek Harness 通知插件:在 **任务完成 / 任务出错 / 运行中 / �
 ## 安装
 
 ```sh
-dsh plugin --profile web add <本目录路径>
+dsh plugin --profile web add dsh-notify-yimit
 ```
 
 然后**重启 dsh web**(host 插件生效需重启),打开 设置 → 通知 开启即可。

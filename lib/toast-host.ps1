@@ -1,12 +1,11 @@
 <# dsh-notify-yimit 常驻浮窗宿主(Windows PowerShell + WPF)。
- 由 dsh-notify-yimit 宿主插件在加载时 spawn 一次并常驻。
- 优化点：JSON序列化深度增加、Tag闭包变量传递优化、BeginInvoke资源回收。 #>
+ 优化点：JSON序列化深度增加、Tag闭包变量传递优化、BeginInvoke资源回收、接收外部Label参数实现多语言。 #>
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
 if ([System.Threading.Thread]::CurrentThread.ApartmentState -ne [System.Threading.ApartmentState]::STA) {
-    [Console]::Error.WriteLine("dsh-notify-yimit: 宿主需要 STA 主线程(当前 $([System.Threading.Thread]::CurrentThread.ApartmentState))")
+    [Console]::Error.WriteLine("dsh-notify-yimit: Host requires STA main thread (current $([System.Threading.Thread]::CurrentThread.ApartmentState))")
     exit 1
 }
 
@@ -16,7 +15,6 @@ $script:stdout.AutoFlush = $true
 
 function Send-Report([object]$obj) {
     try {
-        # 优化：增加 -Depth 10 防止深层对象截断
         $script:stdout.WriteLine(($obj | ConvertTo-Json -Compress -Depth 10))
     } catch { }
 }
@@ -26,7 +24,7 @@ $script:exitRequested = $false
 
 function Parse-Color([string]$hex, [string]$fallback) {
     $h = $hex.TrimStart('#')
-    if ($h.Length -eq 3) { $h = ($h.ToCharArray() | ForEach-Object { "$_$_" }) -join '' }
+    if ($h.Length -eq 3) { $h = ($h.ToCharArray() | ForEach-Object { "$$_" }) -join '' }
     if ($h.Length -eq 6) { $h = "FF$h" }
     if ($h.Length -ne 8 -or $h -notmatch '^[0-9a-fA-F]{8}$') { $h = $fallback.TrimStart('#') }
     return [System.Windows.Media.Color]::FromArgb(
@@ -51,7 +49,7 @@ function New-ToastButton([string]$label, [scriptblock]$onClick, [bool]$primary, 
     
     $txt = New-Object System.Windows.Controls.TextBlock
     $txt.Text = $label
-    $txt.FontFamily = New-Object System.Windows.Media.FontFamily("Microsoft YaHei UI")
+    $txt.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
     $txt.FontSize = 12
     $txt.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
     $txt.IsHitTestVisible = $false
@@ -69,7 +67,6 @@ function New-ToastButton([string]$label, [scriptblock]$onClick, [bool]$primary, 
     }
     $bd.Child = $txt
     
-    # 优化：将闭包变量存入 Tag，避免作用域可见性问题
     $bd.Tag = @{ primary = $primary; onClick = $onClick; hoverP = $hoverP; hoverI = $hoverI; downP = $downP; downI = $downI; fg = $fg; bg = $bg }
     
     $bd.Add_MouseEnter({
@@ -154,10 +151,13 @@ function New-ToastWindow($cmd) {
     $root.Margin = New-Object System.Windows.Thickness(14,12,14,12)
     $border.Child = $root
     
+    # 优化：支持多语言，接收传入的 label，如果没有则使用后备英文
+    $unnamedLabel = if ([string]::IsNullOrEmpty([string]$cmd.unnamedLabel)) { "(Unnamed session)" } else { [string]$cmd.unnamedLabel }
+    
     $titleText = New-Object System.Windows.Controls.TextBlock
-    $titleText.Text = if ([string]::IsNullOrEmpty([string]$cmd.title)) { "(未命名会话)" } else { [string]$cmd.title }
+    $titleText.Text = if ([string]::IsNullOrEmpty([string]$cmd.title)) { $unnamedLabel } else { [string]$cmd.title }
     $titleText.Foreground = $fgBrush
-    $titleText.FontFamily = New-Object System.Windows.Media.FontFamily("Microsoft YaHei UI")
+    $titleText.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
     $titleText.FontSize = 13
     $titleText.FontWeight = [System.Windows.FontWeights]::SemiBold
     $titleText.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
@@ -167,7 +167,7 @@ function New-ToastWindow($cmd) {
     $bodyText = New-Object System.Windows.Controls.TextBlock
     $bodyText.Text = [string]$cmd.text
     $bodyText.Foreground = $fgBrush
-    $bodyText.FontFamily = New-Object System.Windows.Media.FontFamily("Microsoft YaHei UI")
+    $bodyText.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
     $bodyText.FontSize = 13
     $bodyText.TextWrapping = [System.Windows.TextWrapping]::Wrap
     $bodyText.Margin = New-Object System.Windows.Thickness(0,0,0,10)
@@ -177,11 +177,13 @@ function New-ToastWindow($cmd) {
     $btnRow.Orientation = [System.Windows.Controls.Orientation]::Horizontal
     $btnRow.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
     
-    $ignoreBtn = New-ToastButton "忽略" ({ Close-WithFade $win }.GetNewClosure()) $false $fgBrush $bgBrush
+    $ignoreLabel = if ([string]::IsNullOrEmpty([string]$cmd.ignoreLabel)) { "Ignore" } else { [string]$cmd.ignoreLabel }
+    $ignoreBtn = New-ToastButton $ignoreLabel ({ Close-WithFade $win }.GetNewClosure()) $false $fgBrush $bgBrush
     $btnRow.Children.Add($ignoreBtn) | Out-Null
     
     if (-not [string]::IsNullOrEmpty([string]$cmd.sessionId)) {
-        $jumpBtn = New-ToastButton "跳转会话" ({
+        $jumpLabel = if ([string]::IsNullOrEmpty([string]$cmd.jumpLabel)) { "Open" } else { [string]$cmd.jumpLabel }
+        $jumpBtn = New-ToastButton $jumpLabel ({
             $url = "$($cmd.baseUrl)/#dsh-notify-yimit/session=$($cmd.sessionId)"
             try {
                 if (-not [string]::IsNullOrEmpty([string]$cmd.browserPath)) {
@@ -318,7 +320,6 @@ $readerRs.Open()
 $readerPs = [System.Management.Automation.PowerShell]::Create()
 $readerPs.Runspace = $readerRs
 $readerPs.AddScript($readerScript).AddArgument($script:cmdQueue) | Out-Null
-# 优化：保存并正确释放异步结果
 $readerAsyncResult = $readerPs.BeginInvoke()
 
 $cmdTimer = New-Object System.Windows.Threading.DispatcherTimer

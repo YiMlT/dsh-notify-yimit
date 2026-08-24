@@ -249,7 +249,7 @@ function New-ToastWindow($cmd) {
         Send-Report @{ type = 'exit'; key = [string]$cmd.key; instance = [int]$cmd.instance }
     }.GetNewClosure()) | Out-Null
     
-    $rec = @{ Win = $win; Body = $bodyText; Timer = $null; Instance = [int]$cmd.instance }
+    $rec = @{ Win = $win; Body = $bodyText; Title = $titleText; Timer = $null; Instance = [int]$cmd.instance }
     $script:toasts[[string]$cmd.key] = $rec
     
     if (-not ($cmd.sticky -eq $true)) {
@@ -283,6 +283,10 @@ function Invoke-Command([string]$line) {
         'text' {
             $rec = $script:toasts[[string]$cmd.key]
             if ($rec -ne $null -and $rec.Body -ne $null) { $rec.Body.Text = [string]$cmd.text }
+        }
+        'title' {
+            $rec = $script:toasts[[string]$cmd.key]
+            if ($rec -ne $null -and $rec.Title -ne $null) { $rec.Title.Text = [string]$cmd.title }
         }
         'move' {
             $rec = $script:toasts[[string]$cmd.key]

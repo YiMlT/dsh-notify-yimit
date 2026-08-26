@@ -19,14 +19,182 @@ function Send-Report([object]$obj) {
     } catch { }
 }
 
+# 编辑模式几何回传:样板窗当前 left/top/width/height(工作区相对坐标)。
+function Send-Geometry($w) {
+    try {
+        $work = [System.Windows.SystemParameters]::WorkArea
+        Send-Report @{
+            type = 'geometry'
+            left = [Math]::Round($w.Left - $work.Left)
+            top = [Math]::Round($w.Top - $work.Top)
+            width = [Math]::Round($w.ActualWidth)
+            height = [Math]::Round($w.ActualHeight)
+        }
+    } catch { }
+}
+
+# 编辑模式样板窗:拖拽移动 + 右下角手柄缩放;拖拽/缩放结束后回传 geometry。
+# 位置与宽度写回配置后,所有后续浮窗按新几何弹出。
+function New-EditSample($cmd) {
+    $bg = Parse-Color ([string]$cmd.bg) "#203a5c"
+    $fg = Parse-Color ([string]$cmd.fg) "#e8f0fb"
+    $bgBrush = New-Object System.Windows.Media.SolidColorBrush($bg)
+    $fgBrush = New-Object System.Windows.Media.SolidColorBrush($fg)
+
+    $win = New-Object System.Windows.Window
+    $win.WindowStyle = [System.Windows.WindowStyle]::None
+    $win.AllowsTransparency = $true
+    $win.Background = [System.Windows.Media.Brushes]::Transparent
+    $win.Topmost = $true
+    $win.ShowInTaskbar = $false
+    if ($null -ne $cmd.width) { $win.Width = [double]$cmd.width } else { $win.Width = 340 }
+    $win.SizeToContent = [System.Windows.SizeToContent]::Height
+
+    $border = New-Object System.Windows.Controls.Border
+    $border.Background = $bgBrush
+    $border.BorderBrush = $fgBrush
+    $border.BorderThickness = New-Object System.Windows.Thickness(1)
+    $border.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $border.Margin = New-Object System.Windows.Thickness(12)
+
+    $root = New-Object System.Windows.Controls.Grid
+    $root.Margin = New-Object System.Windows.Thickness(14,12,14,12)
+    $border.Child = $root
+
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $titleText = New-Object System.Windows.Controls.TextBlock
+    $titleText.Text = if ([string]::IsNullOrEmpty([string]$cmd.title)) { "Notification preview" } else { [string]$cmd.title }
+    $titleText.Foreground = $fgBrush
+    $titleText.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
+    $titleText.FontSize = 13
+    $titleText.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $titleText.Margin = New-Object System.Windows.Thickness(0,0,0,6)
+    $stack.Children.Add($titleText) | Out-Null
+    $bodyText = New-Object System.Windows.Controls.TextBlock
+    $bodyText.Text = "拖动移动 · 拖拽窗口左右边缘调整宽度 · 完成后在设置页点「完成编辑」"
+    $bodyText.Foreground = $fgBrush
+    $bodyText.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
+    $bodyText.FontSize = 12
+    $bodyText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $stack.Children.Add($bodyText) | Out-Null
+    $root.Children.Add($stack) | Out-Null
+
+    # 左右边缘缩放条(像 Windows 窗口一样拖拽边缘调宽度):8px 宽、通高,
+    # 半透明文字色填充提示可拖拽区域,光标为左右双向箭头。
+    $edgeBrush = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(38, $fg.R, $fg.G, $fg.B))
+    $leftStrip = New-Object System.Windows.Controls.Border
+    $leftStrip.Width = 8
+    $leftStrip.Cursor = [System.Windows.Input.Cursors]::SizeWE
+    $leftStrip.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+    $leftStrip.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+    $leftStrip.Background = $edgeBrush
+    $leftStrip.CornerRadius = New-Object System.Windows.CornerRadius(12,0,0,12)
+    $rightStrip = New-Object System.Windows.Controls.Border
+    $rightStrip.Width = 8
+    $rightStrip.Cursor = [System.Windows.Input.Cursors]::SizeWE
+    $rightStrip.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+    $rightStrip.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+    $rightStrip.Background = $edgeBrush
+    $rightStrip.CornerRadius = New-Object System.Windows.CornerRadius(0,12,12,0)
+
+    # 外层 Grid:边框 + 左右缩放条叠放(缩放条覆盖窗口左右边缘)
+    $outer = New-Object System.Windows.Controls.Grid
+    $outer.Children.Add($border) | Out-Null
+    $outer.Children.Add($leftStrip) | Out-Null
+    $outer.Children.Add($rightStrip) | Out-Null
+
+    # 共享拖拽/缩放状态(事件回调看不到函数局部变量,放 Tag)
+    $win.Tag = @{ resizing = $false; startX = 0.0; startWidth = 0.0; startLeft = 0.0; edge = 'right' }
+
+    $win.Add_Loaded({
+        $work = [System.Windows.SystemParameters]::WorkArea
+        $pos = $cmd.position
+        if ($null -ne $pos -and $null -ne $pos.left -and $null -ne $pos.top) {
+            $win.Left = [double]$pos.left + $work.Left
+            $win.Top = [double]$pos.top + $work.Top
+        } else {
+            $win.Left = $work.Right - $win.ActualWidth - 20
+            $win.Top = $work.Bottom - $win.ActualHeight - 20
+        }
+        Send-Geometry $win
+    }.GetNewClosure()) | Out-Null
+
+    # 拖拽移动(缩放条区域除外):DragMove 阻塞至松开,结束后收敛到工作区内并回传几何。
+    $win.Add_MouseLeftButtonDown({
+        if ($win.Tag.resizing) { $win.Tag.resizing = $false; return }
+        try {
+            $win.DragMove()
+        } catch { }
+        try {
+            $work = [System.Windows.SystemParameters]::WorkArea
+            $win.Left = [Math]::Max($work.Left, [Math]::Min($win.Left, $work.Right - $win.ActualWidth))
+            $win.Top = [Math]::Max($work.Top, [Math]::Min($win.Top, $work.Bottom - $win.ActualHeight))
+        } catch { }
+        Send-Geometry $win
+    }.GetNewClosure()) | Out-Null
+
+    # 拖拽边缘缩放宽度(260–520):右缘拖右变宽;左缘拖左变宽且右缘固定(窗口左移)。
+    # 注意:$strip/$edge/$win 都作为函数参数,闭包才能可靠捕获。
+    function Add-EdgeResize($strip, [string]$edge, $w) {
+        $strip.Add_MouseLeftButtonDown({
+            $w.Tag.resizing = $true
+            $w.Tag.edge = $edge
+            $w.Tag.startX = $_.GetPosition($w).X
+            $w.Tag.startWidth = $w.ActualWidth
+            $w.Tag.startLeft = $w.Left
+            $strip.CaptureMouse()
+            $_.Handled = $true
+        }.GetNewClosure()) | Out-Null
+        $strip.Add_MouseMove({
+            if ($w.Tag.resizing) {
+                $dx = $_.GetPosition($w).X - $w.Tag.startX
+                if ($w.Tag.edge -eq 'left') {
+                    $nw = [Math]::Max(260, [Math]::Min(520, [Math]::Round($w.Tag.startWidth - $dx)))
+                    $w.Width = $nw
+                    $w.Left = $w.Tag.startLeft + ($w.Tag.startWidth - $w.Width)
+                } else {
+                    $nw = [Math]::Max(260, [Math]::Min(520, [Math]::Round($w.Tag.startWidth + $dx)))
+                    $w.Width = $nw
+                }
+                $_.Handled = $true
+            }
+        }.GetNewClosure()) | Out-Null
+        $strip.Add_MouseLeftButtonUp({
+            if ($w.Tag.resizing) {
+                $w.Tag.resizing = $false
+                if ($strip.IsMouseCaptured) { $strip.ReleaseMouseCapture() }
+                Send-Geometry $w
+                $_.Handled = $true
+            }
+        }.GetNewClosure()) | Out-Null
+    }
+    Add-EdgeResize $leftStrip 'left' $win
+    Add-EdgeResize $rightStrip 'right' $win
+
+    $win.Add_Closed({
+        if ($script:editSample -eq $win) { $script:editSample = $null }
+    }.GetNewClosure()) | Out-Null
+
+    $win.Content = $outer
+    return $win
+}
+
 $script:toasts = @{}
 $script:exitRequested = $false
+# 编辑模式样板窗(不进入 toasts 注册表,不参与堆叠;edit-end 时关闭)。
+$script:editSample = $null
 
 function Parse-Color([string]$hex, [string]$fallback) {
     $h = $hex.TrimStart('#')
-    if ($h.Length -eq 3) { $h = ($h.ToCharArray() | ForEach-Object { "$$_" }) -join '' }
+    if ($h.Length -eq 3) { $h = ($h.ToCharArray() | ForEach-Object { "$_$_" }) -join '' }
     if ($h.Length -eq 6) { $h = "FF$h" }
-    if ($h.Length -ne 8 -or $h -notmatch '^[0-9a-fA-F]{8}$') { $h = $fallback.TrimStart('#') }
+    if ($h.Length -ne 8 -or $h -notmatch '^[0-9a-fA-F]{8}$') {
+        # 非法/缺失输入:改用回退色并同样做 3/6 位展开 + 补 FF(此前 FF 步骤在回退赋值之前,
+        # 回退为 6 位时未补前缀,Substring 越界抛异常)。
+        $h = $fallback.TrimStart('#')
+        if ($h.Length -eq 3) { $h = ($h.ToCharArray() | ForEach-Object { "$_$_" }) -join '' }
+        if ($h.Length -eq 6) { $h = "FF$h" }
+    }
     return [System.Windows.Media.Color]::FromArgb(
         [Convert]::ToInt32($h.Substring(0,2), 16),
         [Convert]::ToInt32($h.Substring(2,2), 16),
@@ -136,7 +304,8 @@ function New-ToastWindow($cmd) {
     $win.Background = [System.Windows.Media.Brushes]::Transparent
     $win.Topmost = $true
     $win.ShowInTaskbar = $false
-    $win.Width = 340
+    # 通知窗口样式:宽度来自配置(默认 340);高度自适应内容。
+    if ($null -ne $cmd.width) { $win.Width = [double]$cmd.width } else { $win.Width = 340 }
     $win.SizeToContent = [System.Windows.SizeToContent]::Height
     if (-not [string]::IsNullOrEmpty([string]$cmd.winTitle)) { $win.Title = [string]$cmd.winTitle }
     
@@ -199,8 +368,16 @@ function New-ToastWindow($cmd) {
     
     $win.Add_Loaded({
         $work = [System.Windows.SystemParameters]::WorkArea
-        $targetLeft = $work.Right - $win.ActualWidth - 20
-        $targetTop = $work.Bottom - $win.ActualHeight - 20 - [int]$cmd.offsetY
+        # 通知窗口位置:配置了自定义位置(position)则按其坐标(工作区相对)+ 堆叠偏移;
+        # 否则默认右下贴边(右/下留边 20)。
+        $pos = $cmd.position
+        if ($null -ne $pos -and $null -ne $pos.left -and $null -ne $pos.top) {
+            $targetLeft = [double]$pos.left + $work.Left
+            $targetTop = [double]$pos.top + $work.Top - [int]$cmd.offsetY
+        } else {
+            $targetLeft = $work.Right - $win.ActualWidth - 20
+            $targetTop = $work.Bottom - $win.ActualHeight - 20 - [int]$cmd.offsetY
+        }
         $win.Left = $targetLeft
         $win.Top = $targetTop + 32
         $win.Opacity = 0
@@ -295,11 +472,38 @@ function Invoke-Command([string]$line) {
                 $slide = New-Object System.Windows.Media.Animation.DoubleAnimation($rec.Win.Top, $top, [TimeSpan]::FromMilliseconds(220))
                 $slide.EasingFunction = $easeMove
                 $rec.Win.BeginAnimation([System.Windows.Window]::TopProperty, $slide)
+                # 可选横向定位:left 数字 = 绝对 X(工作区相对);left 'default' = 默认右下贴边
+                # (工作区右缘 - 宽度 - 20)。用于编辑调整位置/恢复默认后,在屏浮窗立即到位。
+                if ($null -ne $cmd.left) {
+                    $newLeft = 0.0
+                    if ($cmd.left -eq 'default') {
+                        $work = [System.Windows.SystemParameters]::WorkArea
+                        $newLeft = $work.Right - $rec.Win.ActualWidth - 20
+                    } else {
+                        $newLeft = [double]$cmd.left
+                    }
+                    $slideL = New-Object System.Windows.Media.Animation.DoubleAnimation($rec.Win.Left, $newLeft, [TimeSpan]::FromMilliseconds(220))
+                    $slideL.EasingFunction = $easeMove
+                    $rec.Win.BeginAnimation([System.Windows.Window]::LeftProperty, $slideL)
+                }
             }
         }
         'close' {
             $rec = $script:toasts[[string]$cmd.key]
             if ($rec -ne $null) { Close-WithFade $rec.Win }
+        }
+        'size' {
+            $rec = $script:toasts[[string]$cmd.key]
+            if ($rec -ne $null -and $null -ne $cmd.width) { $rec.Win.Width = [double]$cmd.width }
+        }
+        'edit' {
+            # 编辑模式:关闭旧样板(如有),弹新样板窗(可拖拽/缩放)。
+            if ($script:editSample -ne $null) { try { $script:editSample.Close() } catch { } ; $script:editSample = $null }
+            $w = New-EditSample $cmd
+            if ($w -ne $null) { $w.Show(); $script:editSample = $w }
+        }
+        'edit-end' {
+            if ($script:editSample -ne $null) { try { $script:editSample.Close() } catch { } ; $script:editSample = $null }
         }
         'shutdown' { $script:exitRequested = $true }
     }
@@ -339,6 +543,10 @@ $cmdTimer.Add_Tick({
             $this.Stop()
             foreach ($key in @($script:toasts.Keys)) {
                 try { $script:toasts[$key].Win.Close() } catch { }
+            }
+            if ($script:editSample -ne $null) {
+                try { $script:editSample.Close() } catch { }
+                $script:editSample = $null
             }
             [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
         }

@@ -500,7 +500,10 @@ function New-ToastWindow($cmd) {
     $ignoreLabel = if ([string]::IsNullOrEmpty([string]$cmd.ignoreLabel)) { "Ignore" } else { [string]$cmd.ignoreLabel }
     $ignoreBtn = New-ToastButton $ignoreLabel ({ Close-WithFade $win }.GetNewClosure()) $false $fgBrush $bgBrush
     $btnRow.Children.Add($ignoreBtn) | Out-Null
-    if (-not [string]::IsNullOrEmpty([string]$cmd.sessionId)) {
+    # 缺省 true = 保留「跳转会话」;桌面端宿主会显式传 jumpEnabled=false 来隐藏它。
+    $jumpEnabled = $true
+    if ($cmd.PSObject.Properties.Name -contains 'jumpEnabled') { $jumpEnabled = [bool]$cmd.jumpEnabled }
+    if ($jumpEnabled -and -not [string]::IsNullOrEmpty([string]$cmd.sessionId)) {
         $jumpLabel = if ([string]::IsNullOrEmpty([string]$cmd.jumpLabel)) { "Open" } else { [string]$cmd.jumpLabel }
         $jumpBtn = New-ToastButton $jumpLabel ({
             $url = "$($cmd.baseUrl)/#dsh-notify-yimit/session=$($cmd.sessionId)"

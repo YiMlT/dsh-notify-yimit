@@ -59,23 +59,169 @@ function Add-GridRow($grid) {
 }
 
 # 编辑模式几何回传:样板窗当前 left/top/width/height(工作区相对坐标)。
+# 样板窗额外回传 baselineTop = 基准线(卡片可见底边)在窗口内的 Y 偏移,
+# 供前端把它换算成屏幕坐标存进配置。
 function Send-Geometry($w) {
     try {
         $work = [System.Windows.SystemParameters]::WorkArea
-        Send-Report @{
-            type   = 'geometry'
-            left   = [Math]::Round($w.Left - $work.Left)
-            top    = [Math]::Round($w.Top - $work.Top)
-            width  = [Math]::Round($w.ActualWidth)
-            height = [Math]::Round($w.ActualHeight)
+        $lineInWin = 0.0
+        if ($w.Tag -is [hashtable] -and $null -ne $w.Tag.lineInWin) {
+            $lineInWin = [double]$w.Tag.lineInWin
         }
+        # ── 坐标口径必须与"重开时的定位口径"完全一致 ──
+        # 定位时:$win.Top = $pos.top − lineInWin(即 $pos.top 是基准线的屏幕 Y)。
+        # 因此这里回传的 top 也必须是**基准线的屏幕 Y**,而不是窗口顶边:
+        #     top = 窗口顶边 + lineInWin
+        # 若回传窗口顶边,index.js 再把它当基准线存下来,就会出现
+        # "每进一次编辑模式基准线就往下漂一个带高"的问题(实测复现过)。
+        # baselineTop 仍回传"基准线从窗口顶边算起的偏移",供前端换算/调试。
+        $msg = @{
+            type        = 'geometry'
+            left        = [Math]::Round($w.Left - $work.Left)
+            top         = [Math]::Round($w.Top - $work.Top + $lineInWin)
+            width       = [Math]::Round($w.ActualWidth)
+            height      = [Math]::Round($w.ActualHeight)
+            baselineTop = [Math]::Round($lineInWin)
+        }
+        Send-Report $msg
     } catch { }
 }
 
 # ───────────────────────── 编辑模式样板窗 ─────────────────────────
 
+# 基准线指示带固定高度(px):横线(2) + 3px 间距 + 箭头(19) + 2px 余量。
+# 固定值而非 Auto:基准线到窗口底边的距离必须可预测,否则回传的基准线位置
+# 会随字体度量浮动、与实际画的那条线对不上(编辑模式靠它反推窗口落点)。
+$script:ANCHOR_BAND_H = 26
+
+# 通知窗口内"可见卡片底边"到**窗口底边**的距离(px)。
+# 实测地推:卡片底边 = 窗口顶边 + (窗口高 − 12);该 12 即 $border.Margin 的辉光边距。
+# 注意它是"到窗口底边"的距离,不是"到窗口顶边"的偏移 —— 因此底部锚定的抬升量
+# 必须写成 (窗口高 − TOAST_BOTTOM_GAP),随卡片高度自适应,绝不能写成固定值:
+#     窗口顶边 = 锚点Y − (窗口高 − TOAST_BOTTOM_GAP) − offsetY
+# 这样"卡片可见底边 = 锚点Y − offsetY",内容多长底边都钉在锚点上。
+$script:TOAST_BOTTOM_GAP = 12
+
+# 箭头用矢量多边形而非字体字形绘制:字形自带行距死区(上/下各数 px),
+# 会把箭头推离横线、甚至溢出窗口被裁切;矢量图形能精确对齐到横线。
+$script:ANCHOR_ARROW_W = 14
+$script:ANCHOR_ARROW_H = 19
+$script:ANCHOR_ARROW_GAP = 3
+
+# 构造向上的空心箭头(chevron)多边形:顶点在正上方,两翼向下张开。
+# 返回 PointCollection,坐标系原点在箭头外接框左上角。
+function New-AnchorArrowPoints([double]$w, [double]$h) {
+    $hw = $w / 2.0
+    $th = [Math]::Max(2.0, $h * 0.45)          # 两翼的竖直厚度
+    $tip = $hw * 0.62                           # 翼尖相对中轴的横向偏移
+    $notch = $h * 0.42                          # 内凹点深度(形成空心)
+    # 注意:PowerShell 中 `-` 与 `*` 的优先级容易误读,复合运算一律加括号。
+    $pts = New-Object System.Windows.Media.PointCollection
+    $pts.Add((New-Object System.Windows.Point($hw, 0)))                        # 顶点(贴住横线)
+    $pts.Add((New-Object System.Windows.Point($w, $th)))                       # 右翼外侧
+    $pts.Add((New-Object System.Windows.Point(($w - ($hw - $tip)), ($th + $tip))))  # 右翼尖端
+    $pts.Add((New-Object System.Windows.Point($hw, $notch)))                   # 内凹点
+    $pts.Add((New-Object System.Windows.Point(($hw - $tip), ($th + $tip))))    # 左翼尖端
+    $pts.Add((New-Object System.Windows.Point(0, $th)))                        # 左翼外侧
+    # 逗号运算符:PointCollection 实现了 IEnumerable,直接 return 会被 PowerShell
+    # 展开成 Object[],导致赋值给 Polygon.Points 失败。
+    return , $pts
+}
+
+# 基准线指示带(仅编辑模式):一条横线 + 居中 ↑,紧贴在卡片"可见底边"正下方,
+# 用来告诉用户"通知以该位置为基准,自定义通知均在此线上方"。
+#
+# 几何约定(方案 A,务必与 New-EditSample 的边距算式保持一致):
+#   · 横线位于网格第 0 行,即带的顶边;↑ 叠放在同一格内(线画在箭头之上)。
+#   · 带高固定(常量 $script:ANCHOR_BAND_H):固定值而非 Auto,基准线到窗口底边
+#     的距离才可预测,回传的基准线位置才不会与实际画的线不一致。
+function New-AnchorBand([System.Windows.Media.Color]$accent, [string]$label, [double]$maxLabelWidth) {
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Height = $script:ANCHOR_BAND_H
+    $grid.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+    # 必须 Top:若用 Center/Stretch 居中,线会被推到格子中间,离卡片底边多出一段距离。
+    $grid.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+
+    # ① 横线:强调色实线 + 辉光,两端小圆点形成"标尺"感
+    $line = New-Object System.Windows.Controls.Grid
+    $line.Height = 2
+    $line.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+    $line.Background = New-Object System.Windows.Media.SolidColorBrush($accent)
+    $line.Effect = New-GlowEffect $accent 0.55
+    foreach ($side in @('Left', 'Right')) {
+        $dot = New-Object System.Windows.Shapes.Ellipse
+        $dot.Width = 6
+        $dot.Height = 6
+        $dot.Fill = New-Object System.Windows.Media.SolidColorBrush($accent)
+        # 竖直居中于 2px 线上,视觉上成为线段两端的端点。
+        # 注意:枚举成员不能用 ::$side 这种写法展开(PowerShell 会当成属性访问而报错),
+        # 必须显式分支赋值。
+        if ($side -eq 'Left') {
+            $dot.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+        } else {
+            $dot.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+        }
+        $dot.Margin = New-Object System.Windows.Thickness(0, -2, 0, -2)
+        $line.Children.Add($dot) | Out-Null
+    }
+    $grid.Children.Add($line) | Out-Null
+
+    # ② ↑ + 可选文字:叠放在线之下(同一格)。
+    #    三列等分(各 1*):中列 = ↑,天然落在整条带的正中点;右列 = 文字。
+    #    这样"文字不会把 ↑ 推偏",且文字过宽时由自身的 TextTrimming 处理。
+    $cap = New-Object System.Windows.Controls.Grid
+    $cap.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+    $cap.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+    $cap.Margin = New-Object System.Windows.Thickness(0, 3, 0, 0)
+    foreach ($i in 1..3) {
+        $col = New-Object System.Windows.Controls.ColumnDefinition
+        $col.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+        $cap.ColumnDefinitions.Add($col) | Out-Null
+    }
+
+    $arrow = New-Object System.Windows.Shapes.Polygon
+    $arrow.Points = New-AnchorArrowPoints $script:ANCHOR_ARROW_W $script:ANCHOR_ARROW_H
+    $arrow.Fill = New-Object System.Windows.Media.SolidColorBrush($accent)
+    $arrow.Width = $script:ANCHOR_ARROW_W
+    $arrow.Height = $script:ANCHOR_ARROW_H
+    $arrow.Stretch = [System.Windows.Media.Stretch]::Fill
+    $arrow.Effect = New-GlowEffect $accent 0.45
+    # 顶点贴住横线,只留 $script:ANCHOR_ARROW_GAP 的呼吸量(矢量图形无字形死区)。
+    $arrow.Margin = New-Object System.Windows.Thickness(0, $script:ANCHOR_ARROW_GAP, 0, 0)
+    $arrow.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+    # 用一个撑满中列的容器来居中箭头:不依赖"列宽 = 箭头宽"这一巧合,
+    # 否则同列的文字一变宽,箭头就会被带偏。
+    $arrowBox = New-Object System.Windows.Controls.Border
+    $arrowBox.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Stretch
+    $arrowBox.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+    $arrowBox.Child = $arrow
+    [System.Windows.Controls.Grid]::SetColumn($arrowBox, 1)
+    $cap.Children.Add($arrowBox) | Out-Null
+
+    if (-not [string]::IsNullOrEmpty($label)) {
+        $txt = New-Object System.Windows.Controls.TextBlock
+        $txt.Text = $label
+        $txt.Foreground = New-Object System.Windows.Media.SolidColorBrush($accent)
+        $txt.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI")
+        $txt.FontSize = 11
+        $txt.Opacity = 0.92
+        $txt.VerticalAlignment = [System.Windows.VerticalAlignment]::Top
+        $txt.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+        $txt.Margin = New-Object System.Windows.Thickness(10, 1, 0, 0)
+        # 限宽 + 省略号:文案过长时按字符截断,不挤压 ↑、也不超出窗口。
+        $txt.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+        $txt.MaxWidth = [Math]::Max(80, $maxLabelWidth)
+        [System.Windows.Controls.Grid]::SetColumn($txt, 2)
+        $cap.Children.Add($txt) | Out-Null
+    }
+
+    $grid.Children.Add($cap) | Out-Null
+    return $grid
+}
+
 # 编辑模式样板窗:拖拽移动 + 左右边缘圆点把手缩放;拖拽/缩放结束后回传 geometry。
-# 强调色描边 + 辉光;内嵌 5 类型实时色卡预览(chips);多语言提示。
+# 强调色描边 + 辉光;内嵌 5 类型实时色卡预览(chips);多语言提示;
+# 卡片下方带"基准线 + ↑"指示带(方案 A)。
 function New-EditSample($cmd) {
     $bg = Parse-Color ([string]$cmd.bg) "#203a5c"
     $fg = Parse-Color ([string]$cmd.fg) "#e8f0fb"
@@ -83,6 +229,25 @@ function New-EditSample($cmd) {
     $bgBrush = New-Object System.Windows.Media.SolidColorBrush($bg)
     $fgBrush = New-Object System.Windows.Media.SolidColorBrush($fg)
     $accentBrush = New-Object System.Windows.Media.SolidColorBrush($accent)
+
+    # ── 几何总纲(务必与手柄、带行的算式保持一致) ──
+    # $glowMargin 同时是:左右辉光呼吸量、卡片左/右/上边距、左右缩放把手的边距。
+    #   · 卡片:左/右边距相等 → 始终居中;卡宽 = 窗口宽 − 2×$glowMargin。
+    #   · 手柄:左右边距同样为 $glowMargin(宽 8px)→ 左右手柄"内沿"之间
+    #     = 窗口宽 − 2×$glowMargin = 卡宽,即手柄与卡片严格等宽、等左右沿。
+    #   · 下边距必须为 0:卡片因此一直铺到第 0 行的底边,而第 1 行(带行)紧随其后,
+    #     所以横线正好压在卡片可见底边上;卡片高度 = 行高 = 手柄高度。
+    #     若在这里留边距,卡片会在自己所在行内被顶上去,横线就会离开卡片底边。
+    #   · 底部呼吸量由带行自身(透明)提供,无需再留边距。
+    $glowMargin = 8
+    $bandHeight = [double]$script:ANCHOR_BAND_H
+    $bottomMargin = 0
+    # 基准线(卡片可见底边)到**窗口底边**的距离 = 卡片下边距 + 带高。
+    # 实测:带(含自身下边距)紧贴第 0 行底部,故卡片可见底边 = 窗口高 − 该值,
+    # 也就是横线自身的 Y。这是"从底部算"的量。
+    # 注意:真正用于定位/回传的是"从窗口顶边算"的 lineInWin(在 Loaded 里实测),
+    # 两者基准不同,不可混用 —— 混用会导致每次重开编辑模式基准线漂移一个带高。
+    $baselineFromBottom = $bottomMargin + $bandHeight
 
     $win = New-Object System.Windows.Window
     $win.WindowStyle = [System.Windows.WindowStyle]::None
@@ -99,7 +264,7 @@ function New-EditSample($cmd) {
     $border.BorderBrush = $accentBrush
     $border.BorderThickness = New-Object System.Windows.Thickness(1)
     $border.CornerRadius = New-Object System.Windows.CornerRadius(14)
-    $border.Margin = New-Object System.Windows.Thickness(12)
+    $border.Margin = New-Object System.Windows.Thickness($glowMargin, $glowMargin, $glowMargin, $bottomMargin)
 
     $root = New-Object System.Windows.Controls.StackPanel
     $root.Margin = New-Object System.Windows.Thickness(16, 14, 16, 14)
@@ -175,6 +340,8 @@ function New-EditSample($cmd) {
     $leftStrip.Cursor = [System.Windows.Input.Cursors]::SizeWE
     $leftStrip.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
     $leftStrip.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+    # 把手竖直范围 = 卡片可见上下沿(下边距用带高,故把手不会压到基准线指示带上)。
+    $leftStrip.Margin = New-Object System.Windows.Thickness(0, $glowMargin, 0, $bottomMargin)
     $leftStrip.Background = $edgeBrush
     $leftStrip.CornerRadius = New-Object System.Windows.CornerRadius(14, 0, 0, 14)
     $rightStrip = New-Object System.Windows.Controls.Border
@@ -182,6 +349,7 @@ function New-EditSample($cmd) {
     $rightStrip.Cursor = [System.Windows.Input.Cursors]::SizeWE
     $rightStrip.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
     $rightStrip.VerticalAlignment = [System.Windows.VerticalAlignment]::Stretch
+    $rightStrip.Margin = New-Object System.Windows.Thickness(0, $glowMargin, 0, $bottomMargin)
     $rightStrip.Background = $edgeBrush
     $rightStrip.CornerRadius = New-Object System.Windows.CornerRadius(0, 14, 14, 0)
 
@@ -206,24 +374,62 @@ function New-EditSample($cmd) {
     Add-GripDots $leftStrip $fg
     Add-GripDots $rightStrip $fg
 
-    # 外层 Grid:边框 + 左右缩放把手叠放(把手覆盖窗口左右边缘)
+    # 外层 Grid:边框 + 基准线指示带 + 左右缩放把手叠放(把手覆盖窗口左右边缘)
     $outer = New-Object System.Windows.Controls.Grid
+    # 两条等分行:第 0 行卡片(占满剩余高度),第 1 行 = 基准线指示带。
+    $rowCard = New-Object System.Windows.Controls.RowDefinition
+    $rowCard.Height = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $rowBand = New-Object System.Windows.Controls.RowDefinition
+    $rowBand.Height = [System.Windows.GridLength]::Auto
+    $outer.RowDefinitions.Add($rowCard) | Out-Null
+    $outer.RowDefinitions.Add($rowBand) | Out-Null
+
+    # 文案限宽:窗口宽度的一半多一点,过长按字符省略。
+    $band = New-AnchorBand $accent ([string]$cmd.anchorLabel) ([Math]::Max(80, $win.Width * 0.55))
+    [System.Windows.Controls.Grid]::SetRow($band, 1)
     $outer.Children.Add($border) | Out-Null
+    $outer.Children.Add($band) | Out-Null
     $outer.Children.Add($leftStrip) | Out-Null
     $outer.Children.Add($rightStrip) | Out-Null
 
     # 共享拖拽/缩放状态(事件回调看不到函数局部变量,放 Tag)
-    $win.Tag = @{ resizing = $false; startX = 0.0; startWidth = 0.0; startLeft = 0.0; edge = 'right' }
+    # lineInWin:基准线(卡片可见底边)从**窗口顶边**量起的 Y 偏移。
+    #   定位与回传都用它,保证"存下的坐标"与"重开时的落点"是同一个量。
+    $win.Tag = @{
+        resizing = $false
+        startX = 0.0
+        startWidth = 0.0
+        startLeft = 0.0
+        edge = 'right'
+        lineInWin = 0.0
+    }
 
     $win.Add_Loaded({
         $work = [System.Windows.SystemParameters]::WorkArea
         $pos = $cmd.position
+        # ── 基准线自测(消除"从顶部算/从底部算"的混用) ──
+        # 先把窗口顶边临时归零,等布局落定后量出基准线在窗口内的真实 Y(从窗口顶边算起)。
+        # 之后定位与 Send-Geometry 回传都用这同一个量,于是"存下的坐标"与"重开的落点"
+        # 必然一致,不会再出现每进一次编辑模式就漂移一截的问题。
+        $win.Top = 0
+        $win.UpdateLayout()
+        $lineInWin = $border.TranslatePoint(
+            (New-Object System.Windows.Point(0, $border.ActualHeight)), $win).Y
+        if ($lineInWin -le 0) {
+            # 兜底:布局尚未就绪时用"窗口高 − 从底部算的距离"估算。
+            $lineInWin = $win.ActualHeight - $bottomMargin - $bandHeight
+        }
+        $win.Tag.lineInWin = $lineInWin
         if ($null -ne $pos -and $null -ne $pos.left -and $null -ne $pos.top) {
             $win.Left = [double]$pos.left + $work.Left
-            $win.Top = [double]$pos.top + $work.Top
+            $win.Top = [double]$pos.top + $work.Top - $lineInWin
         } else {
-            $win.Left = $work.Right - $win.ActualWidth - 20
-            $win.Top = $work.Bottom - $win.ActualHeight - 20
+            # 编辑模式的样板窗贴住工作区右下角:窗口底边 = 工作区底边。
+            # (此处不加 20px 呼吸量 —— 用户明确要求样板窗能贴到屏幕最底部;
+            #  窗口底边即"基准线 + ↑"指示带所在行,基准线因此落在离屏幕底
+            #  一个带高的位置,通知向上堆叠时正好从屏幕底部往上排。)
+            $win.Left = $work.Right - $win.ActualWidth
+            $win.Top = $work.Bottom - $win.ActualHeight
         }
         Send-Geometry $win
     }.GetNewClosure()) | Out-Null
@@ -555,12 +761,32 @@ function New-ToastWindow($cmd) {
     $win.Add_Loaded({
         $work = [System.Windows.SystemParameters]::WorkArea
         $pos =$cmd.position
+        # ── 底部锚定定位 ──
+        # 目标:本条通知"可见卡片底边"落在锚点上(卡片多高都只影响顶边)。
+        #
+        # 抬升量由布局实测得出,而不是靠写死的常量:
+        #   $border 就是那张可见卡片,先把窗口顶边临时放到 0,量出它相对窗口的下边缘
+        #   ($borderBottomInWin),于是
+        #       窗口顶边 = 锚点Y − $borderBottomInWin − offsetY
+        #   其中 offsetY = 该条之上已叠的高度(首条为 0)。
+        # 先前用固定常量推算,卡片高度随内容变化时底边会偏离锚点(实测可差 12px 以上),
+        # 所以这里改成"用布局真实值",与卡片高度彻底解耦。
+        # 另:也不能写成 "$pos.top − offsetY"(那是把 pos.top 当窗口顶边的顶边锚定)。
+        $win.Top = 0
+        $win.UpdateLayout()
+        $borderBottomInWin = $border.TranslatePoint(
+            (New-Object System.Windows.Point(0, $border.ActualHeight)), $win).Y
+        if ($borderBottomInWin -le 0) {
+            # 兜底:布局尚未就绪时退回到"窗口高 − 常量"的估算。
+            $borderBottomInWin = $win.ActualHeight - $script:TOAST_BOTTOM_GAP
+        }
         if ($null -ne$pos -and $null -ne$pos.left -and $null -ne$pos.top) {
             $targetLeft = [double]$pos.left + $work.Left
-            $targetTop = [double]$pos.top + $work.Top - [int]$cmd.offsetY
+            $targetTop = [double]$pos.top + $work.Top - $borderBottomInWin - [int]$cmd.offsetY
         } else {
+            # 默认右下:可见卡片底边距工作区底边 20px(与 index.js 的 TOAST_EDGE_PAD 一致)。
             $targetLeft =$work.Right - $win.ActualWidth - 20
-            $targetTop =$work.Bottom - $win.ActualHeight - 20 - [int]$cmd.offsetY
+            $targetTop =$work.Bottom - 20 - $borderBottomInWin - [int]$cmd.offsetY
         }
         $win.Left =$targetLeft
         $win.Top =$targetTop + 36

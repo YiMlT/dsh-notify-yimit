@@ -519,6 +519,222 @@ $downI = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.C
 $hoverP = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(196, 202, 208))
 $hoverI = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(44, 52, 62))
 
+# 「返回应用」:把已在运行的 DeepSeek Harness 桌面窗口切到前台。
+#
+# 为什么不能靠 dsh://open:应用只在 macOS 的 `open-url` 事件里处理 `dsh://open`
+# (Windows 上协议 URL 是作为 argv 交给新进程的,而它的 `second-instance` 处理器
+# 不读 argv、也不校验 URL),所以那条路在 Windows 上是死代码。
+#
+# 因此改为直接枚举窗口并激活。合法性:用户点按钮的那一刻,前台窗口就是这个 WPF
+# 浮窗(属于本宿主进程),所以宿主调用 SetForegroundWindow 不会被
+# "只有前台进程才能抢占前台"的系统限制挡住。
+$script:ToastWin32Ready = $false
+try {
+    if (-not ('ToastWin32' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public class ToastWin32 {
+    public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWPLACEMENT {
+        public int length;
+        public int flags;
+        public int showCmd;
+        public POINT ptMinPosition;
+        public POINT ptMaxPosition;
+        public RECT rcNormalPosition;
+    }
+
+    private const uint GW_OWNER = 4;
+    private const int SW_SHOWNORMAL = 1;
+    private const int SW_SHOWMINIMIZED = 2;
+    private const int SW_SHOWMAXIMIZED = 3;
+    private const int SW_SHOW = 5;
+    private const int SW_RESTORE = 9;
+    /// WPF_RESTORETOMAXIMIZED:最小化前是最大化状态
+    private const int WPF_RESTORETOMAXIMIZED = 0x0002;
+
+    /// 找出 pid 名下最可能是"主窗口"的顶层窗口。
+    ///
+    /// 实测要点(这台机器上枚举到 280 个窗口、其中 20 个可见):
+    /// 应用最小化到托盘 / 被隐藏时,它的主窗口会变成 **不可见**,甚至带上 owner
+    /// 关系。若像最初那样要求"可见 + 非 owner",这两条会把主窗口全部滤掉,
+    /// 结果就是"点了返回应用没反应"。因此这里分级挑选:
+    ///   1) 可见 + 有标题 + 非 owner(正常情况,最可靠)
+    ///   2) 有标题 + 非 owner(隐藏/托盘态)
+    ///   3) 有标题(连 owner 关系都能容忍)
+    /// 每级内部取面积最大者,Electron 的辅助窗口通常面积很小或没有标题。
+    public static IntPtr FindMainWindow(uint pid) {
+        IntPtr shell = GetShellWindow();
+        IntPtr[] best = new IntPtr[3];
+        long[] bestArea = new long[3] { -1, -1, -1 };
+        EnumWindows(delegate(IntPtr h, IntPtr p) {
+            uint wpid = 0;
+            GetWindowThreadProcessId(h, out wpid);
+            if (wpid != pid) return true;
+            if (h == shell) return true;
+            if (GetWindowTextLength(h) <= 0) return true;
+
+            bool visible = IsWindowVisible(h);
+            bool owned = GetWindow(h, GW_OWNER) != IntPtr.Zero;
+            RECT r;
+            if (!GetWindowRect(h, out r)) return true;
+            long area = (long)(r.Right - r.Left) * (long)(r.Bottom - r.Top);
+
+            int tier;
+            if (visible && !owned) tier = 0;
+            else if (!owned) tier = 1;
+            else tier = 2;
+
+            if (area > bestArea[tier]) { bestArea[tier] = area; best[tier] = h; }
+            return true;
+        }, IntPtr.Zero);
+
+        for (int i = 0; i < 3; i++) { if (best[i] != IntPtr.Zero) return best[i]; }
+        return IntPtr.Zero;
+    }
+
+    /// 把 hWnd 提到前台,并**保持窗口原有的尺寸/最大化状态**。
+    ///
+    /// 关键:`ShowWindow(h, SW_RESTORE)` 会把"最小化**或**最大化"的窗口还原成
+    /// 原始(默认)尺寸 —— 这正是"窗口本来最大化、只是不在最上层,点返回应用后
+    /// 变成默认大小"的原因。所以这里必须先查询显示状态:
+    ///   · 最小化 → SW_RESTORE(恢复原尺寸,若原先最大化会恢复成最大化)
+    ///   · 最大化 → SW_SHOWMAXIMIZED
+    ///   · 普通   → SW_SHOW(只显示/置顶,**不改尺寸**)
+    /// SetForegroundWindow 受"仅前台进程可抢占前台"限制,失败时按通行做法
+    /// 附加到当前前台线程的输入队列后重试一次。
+    public static bool Activate(IntPtr h) {
+        if (h == IntPtr.Zero) return false;
+
+        WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+        wp.length = Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+        int show = SW_SHOW;
+        if (GetWindowPlacement(h, ref wp)) {
+            int cur = wp.showCmd;
+            if (cur == SW_SHOWMINIMIZED) {
+                show = (wp.flags & WPF_RESTORETOMAXIMIZED) != 0 ? SW_SHOWMAXIMIZED : SW_RESTORE;
+            } else if (cur == SW_SHOWMAXIMIZED) {
+                show = SW_SHOWMAXIMIZED;
+            }
+        }
+        ShowWindow(h, show);
+
+        if (SetForegroundWindow(h)) return true;
+        IntPtr fg = GetForegroundWindow();
+        uint dummy = 0;
+        uint tidFg = fg == IntPtr.Zero ? 0u : GetWindowThreadProcessId(fg, out dummy);
+        uint tidMe = GetWindowThreadProcessId(GetShellWindow(), out dummy);
+        if (tidFg != 0u && tidFg != tidMe) {
+            if (AttachThreadInput(tidMe, tidFg, true)) {
+                bool ok = SetForegroundWindow(h);
+                AttachThreadInput(tidMe, tidFg, false);
+                if (ok) return true;
+            }
+        }
+        return SetForegroundWindow(h);
+    }
+}
+'@ -ErrorAction Stop
+    }
+    $script:ToastWin32Ready = $true
+} catch {
+    # Win32 互操作不可用(极少见):activateLabel 会因此不下发,按钮不出现。
+    $script:ToastWin32Ready = $false
+}
+
+function Write-ActLog([string]$msg) {
+    # 诊断日志:激活这一步涉及"按 exe 路径找进程 + 枚举窗口"两处环境相关行为,
+    # 出问题时按钮只会静默无反应,没有日志无法定位。
+    # 落点优先级:脚本所在目录(真实宿主 = lib/)→ DSH_HOME。
+    try {
+        $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $msg`r`n"
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        $dirs = @()
+        if (-not [string]::IsNullOrEmpty($PSScriptRoot)) { $dirs += $PSScriptRoot }
+        if (-not [string]::IsNullOrEmpty($env:DSH_HOME)) { $dirs += $env:DSH_HOME }
+        foreach ($d in $dirs) {
+            try {
+                [System.IO.File]::AppendAllText((Join-Path $d 'activate-debug.log'), $line, $enc)
+                return
+            } catch { }
+        }
+    } catch { }
+}
+
+# 启动探针:宿主每次加载(含插件重载)都记一行门控状态。
+# 必须放在 Write-ActLog 定义之后,否则这个调用会因函数未定义而静默失效。
+try {
+    $probe = "boot: Win32Ready=$script:ToastWin32Ready"
+    try { $probe += " selfExe='$((Get-Process -Id $PID).Path)'" } catch { $probe += " selfExe=<取不到>" }
+    try { $probe += " DSH_HOME='$env:DSH_HOME'" } catch { }
+    try { $probe += " PSScriptRoot='$PSScriptRoot'" } catch { }
+    Write-ActLog $probe
+} catch { }
+
+function Invoke-ToastActivateApp([string]$appPath) {
+    try {
+        Write-ActLog "--- click ---"
+        Write-ActLog "Win32Ready=$script:ToastWin32Ready appPath='$appPath'"
+        if (-not $script:ToastWin32Ready) { Write-ActLog "中止: Win32 助手不可用"; return }
+        if ([string]::IsNullOrEmpty($appPath)) { Write-ActLog "中止: appPath 为空"; return }
+        $full = $null
+        try { $full = [System.IO.Path]::GetFullPath($appPath) } catch { Write-ActLog "中止: GetFullPath 失败"; return }
+        Write-ActLog "full='$full' exists=$(Test-Path -LiteralPath $full)"
+        if (-not (Test-Path -LiteralPath $full)) { Write-ActLog "中止: exe 路径不存在"; return }
+
+        # Electron 的主进程与各渲染进程都是同一个 exe,窗口可能挂在其中任意一个 PID 上,
+        # 所以把全部同 exe 的进程当作一组来挑窗口,而不是"谁先回答就用谁"。
+        $procs = @()
+        foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+            try { if ($p.Path -eq $full) { $procs += $p } } catch { }
+        }
+        Write-ActLog "按 exe 匹配=$($procs.Count) pids=$(($procs | ForEach-Object { $_.Id }) -join ',')"
+        if ($procs.Count -eq 0) {
+            # 兜底:按进程名匹配(某些情况下 Path 取不到)。
+            $nm = [System.IO.Path]::GetFileNameWithoutExtension($full)
+            $procs = @(Get-Process -Name $nm -ErrorAction SilentlyContinue)
+            Write-ActLog "按名 '$nm' 兜底=$($procs.Count) pids=$(($procs | ForEach-Object { $_.Id }) -join ',')"
+        }
+        foreach ($p in $procs) {
+            $h = [ToastWin32]::FindMainWindow([uint32]$p.Id)
+            Write-ActLog "  pid=$($p.Id) hwnd=$h"
+            if ($h -ne [IntPtr]::Zero) {
+                $ok = [ToastWin32]::Activate($h)
+                Write-ActLog "  Activate=$ok fg=$([ToastWin32]::GetForegroundWindow())"
+                if ($ok) { return }
+            }
+        }
+        Write-ActLog "结束: 未找到可激活窗口"
+    } catch {
+        Write-ActLog "异常: $($_.Exception.GetType().Name) :: $($_.Exception.Message)"
+    }
+}
+
 # 浮窗按钮:primary 时传入强调色画刷,hover/按压基于该色自动提亮/压暗;
 # secondary 保持描边透明底样式。
 function New-ToastButton([string]$label, [scriptblock]$onClick, [bool]$primary, [System.Windows.Media.SolidColorBrush]$fg, [System.Windows.Media.SolidColorBrush]$bg) {
@@ -706,6 +922,19 @@ function New-ToastWindow($cmd) {
     $ignoreLabel = if ([string]::IsNullOrEmpty([string]$cmd.ignoreLabel)) { "Ignore" } else { [string]$cmd.ignoreLabel }
     $ignoreBtn = New-ToastButton $ignoreLabel ({ Close-WithFade $win }.GetNewClosure()) $false $fgBrush $bgBrush
     $btnRow.Children.Add($ignoreBtn) | Out-Null
+    # 「返回应用」:位于「忽略」右侧;仅桌面端出现(由 index.js 按 isDesktopRuntime 下发
+    # activateLabel)。点击后把应用窗口切到前台,但**不**关闭本条通知。
+    # 另外要求 Win32 互操作可用(否则无法激活窗口,宁可不显示这个按钮)。
+    $activateLabel = [string]$cmd.activateLabel
+    $appPath = [string]$cmd.appPath
+    if ($script:ToastWin32Ready -and -not [string]::IsNullOrEmpty($activateLabel) -and
+        -not [string]::IsNullOrEmpty($appPath)) {
+        $activateBtn = New-ToastButton $activateLabel ({
+            Invoke-ToastActivateApp $appPath
+            # 按要求保留通知,不做 Close-WithFade。
+        }.GetNewClosure()) $false $fgBrush $bgBrush
+        $btnRow.Children.Add($activateBtn) | Out-Null
+    }
     # 缺省 true = 保留「跳转会话」;桌面端宿主会显式传 jumpEnabled=false 来隐藏它。
     $jumpEnabled = $true
     if ($cmd.PSObject.Properties.Name -contains 'jumpEnabled') { $jumpEnabled = [bool]$cmd.jumpEnabled }

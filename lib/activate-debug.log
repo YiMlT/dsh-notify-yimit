@@ -1,0 +1,15 @@
+2026-10-02 15:39:15  boot: Win32Ready=True selfExe='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' DSH_HOME='' PSScriptRoot='D:\Desktop\java\Deepseek_Harness\dsh-notify-yimit\lib'
+2026-10-02 15:40:35  --- click ---
+2026-10-02 15:40:35  Win32Ready=True appPath='D:\deepseek harness\DeepSeek Harness.exe'
+2026-10-02 15:40:35  full='D:\deepseek harness\DeepSeek Harness.exe' exists=True
+2026-10-02 15:40:35  按 exe 匹配=5 pids=4152,9328,13520,15256,18720
+2026-10-02 15:40:35    pid=4152 hwnd=0
+2026-10-02 15:40:35    pid=9328 hwnd=1246924
+2026-10-02 15:40:35    Activate=True fg=1246924
+2026-10-02 15:40:39  --- click ---
+2026-10-02 15:40:39  Win32Ready=True appPath='D:\deepseek harness\DeepSeek Harness.exe'
+2026-10-02 15:40:39  full='D:\deepseek harness\DeepSeek Harness.exe' exists=True
+2026-10-02 15:40:40  按 exe 匹配=5 pids=4152,9328,13520,15256,18720
+2026-10-02 15:40:40    pid=4152 hwnd=0
+2026-10-02 15:40:40    pid=9328 hwnd=1246924
+2026-10-02 15:40:40    Activate=True fg=1246924
